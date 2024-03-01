@@ -14,20 +14,29 @@
  * limitations under the License.
  */
 
-import * as childProcess from 'child_process';
-import { withTmpFile } from 'etcher-sdk/build/tmp';
-import { promises as fs } from 'fs';
-import * as _ from 'lodash';
-import * as os from 'os';
-import * as semver from 'semver';
-import * as sudoPrompt from '@balena/sudo-prompt';
-import { promisify } from 'util';
+/**
+ * TODO:
+ * This is convoluted and needlessly complex. It should be simplified and modernized.
+ * The environment variable setting and escaping should be greatly simplified by letting {linux|catalina}-sudo handle that.
+ * We shouldn't need to write a script to a file and then execute it. We should be able to forwatd the command to the sudo code directly.
+ */
 
-import { sudo as catalinaSudo } from './catalina-sudo/sudo';
-import * as errors from './errors';
+import * as childProcess from "child_process";
+import { withTmpFile } from "etcher-sdk/build/tmp";
+import { promises as fs } from "fs";
+import * as _ from "lodash";
+import * as os from "os";
+import * as semver from "semver";
+import { promisify } from "util";
+
+import { sudo as catalinaSudo } from "./sudo/catalina-sudo";
+import { sudo as linuxSudo } from "./sudo/linux-sudo";
+import * as sudoPrompt from "@balena/sudo-prompt"; // this is still used on windows (see sudo-windows.ts for next step)
+import * as errors from "./errors";
 
 const execAsync = promisify(childProcess.exec);
-const execFileAsync = promisify(childProcess.execFile);
+// const execFileAsync = promisify(childProcess.execFile);
+const spawn = childProcess.spawn;
 
 type Std = string | Buffer | undefined;
 
@@ -56,12 +65,13 @@ function sudoExecAsync(
 const UNIX_SUPERUSER_USER_ID = 0;
 
 export async function isElevated(): Promise<boolean> {
-	if (os.platform() === 'win32') {
+	// console.log("isElevated ?");
+	if (os.platform() === "win32") {
 		// `fltmc` is available on WinPE, XP, Vista, 7, 8, and 10
 		// Works even when the "Server" service is disabled
 		// See http://stackoverflow.com/a/28268802
 		try {
-			await execAsync('fltmc');
+			await execAsync("fltmc");
 		} catch (error: any) {
 			if (error.code === os.constants.errno.EPERM) {
 				return false;
@@ -108,17 +118,17 @@ export function createLaunchScript(
 	argv: string[],
 	environment: _.Dictionary<string | undefined>,
 ): string {
-	const isWindows = os.platform() === 'win32';
+	const isWindows = os.platform() === "win32";
 	const lines = [];
 	if (isWindows) {
 		// Switch to utf8
-		lines.push('chcp 65001');
+		lines.push("chcp 65001");
 	}
 	const [setEnvVarFn, escapeFn] = isWindows
 		? [setEnvVarCmd, escapeParamCmd]
 		: [setEnvVarSh, escapeSh];
 	lines.push(..._.map(environment, setEnvVarFn));
-	lines.push([command, ...argv].map(escapeFn).join(' '));
+	lines.push([command, ...argv].map(escapeFn).join(" "));
 	return lines.join(os.EOL);
 }
 
@@ -127,7 +137,7 @@ async function elevateScriptWindows(
 	name: string,
 ): Promise<{ cancelled: false }> {
 	// '&' needs to be escaped here (but not when written to a .cmd file)
-	const cmd = ['cmd', '/c', escapeParamCmd(path).replace(/&/g, '^&')].join(' ');
+	const cmd = ["cmd", "/c", escapeParamCmd(path).replace(/&/g, "^&")].join(" ");
 	await sudoExecAsync(cmd, { name });
 	return { cancelled: false };
 }
@@ -136,15 +146,17 @@ async function elevateScriptUnix(
 	path: string,
 	name: string,
 ): Promise<{ cancelled: boolean }> {
-	const cmd = ['bash', escapeSh(path)].join(' ');
-	await sudoExecAsync(cmd, { name });
+	const cmd = ["bash", escapeSh(path)].join(" ");
+	console.log("elevateScriptUnix", cmd);
+	await linuxSudo(cmd, { name });
 	return { cancelled: false };
 }
 
 async function elevateScriptCatalina(
 	path: string,
 ): Promise<{ cancelled: boolean }> {
-	const cmd = ['bash', escapeSh(path)].join(' ');
+	console.log("elevateScriptCatalina", path);
+	const cmd = ["bash", escapeSh(path)].join(" ");
 	try {
 		const { cancelled } = await catalinaSudo(cmd);
 		return { cancelled };
@@ -156,27 +168,28 @@ async function elevateScriptCatalina(
 export async function elevateCommand(
 	command: string[],
 	options: {
-		environment: _.Dictionary<string | undefined>;
+		env: _.Dictionary<string | undefined>;
 		applicationName: string;
 	},
 ): Promise<{ cancelled: boolean }> {
+	console.log("elevateCommand");
 	if (await isElevated()) {
-		await execFileAsync(command[0], command.slice(1), {
-			env: options.environment,
+		spawn(command[0], command.slice(1), {
+			env: options.env,
 		});
 		return { cancelled: false };
 	}
-	const isWindows = os.platform() === 'win32';
+	const isWindows = os.platform() === "win32";
 	const launchScript = createLaunchScript(
 		command[0],
 		command.slice(1),
-		options.environment,
+		options.env,
 	);
 	return await withTmpFile(
 		{
 			keepOpen: false,
-			prefix: 'balena-etcher-electron-',
-			postfix: '.cmd',
+			prefix: "balena-etcher-electron-",
+			postfix: ".cmd",
 		},
 		async ({ path }) => {
 			await fs.writeFile(path, launchScript);
@@ -184,38 +197,38 @@ export async function elevateCommand(
 				return elevateScriptWindows(path, options.applicationName);
 			}
 			if (
-				os.platform() === 'darwin' &&
-				semver.compare(os.release(), '19.0.0') >= 0
+				os.platform() === "darwin" &&
+				semver.compare(os.release(), "19.0.0") >= 0
 			) {
 				// >= macOS Catalina
 				return elevateScriptCatalina(path);
 			}
 			try {
-				return await elevateScriptUnix(path, options.applicationName);
+				return elevateScriptUnix(path, options.applicationName);
 			} catch (error: any) {
 				// We're hardcoding internal error messages declared by `sudo-prompt`.
 				// There doesn't seem to be a better way to handle these errors, so
 				// for now, we should make sure we double check if the error messages
 				// have changed every time we upgrade `sudo-prompt`.
-				console.log('error', error);
-				if (_.includes(error.message, 'is not in the sudoers file')) {
+				console.log("error", error);
+				if (_.includes(error.message, "is not in the sudoers file")) {
 					throw errors.createUserError({
 						title: "Your user doesn't have enough privileges to proceed",
 						description:
-							'This application requires sudo privileges to be able to write to drives',
+							"This application requires sudo privileges to be able to write to drives",
 					});
-				} else if (_.startsWith(error.message, 'Command failed:')) {
+				} else if (_.startsWith(error.message, "Command failed:")) {
 					throw errors.createUserError({
-						title: 'The elevated process died unexpectedly',
+						title: "The elevated process died unexpectedly",
 						description: `The process error code was ${error.code}`,
 					});
-				} else if (error.message === 'User did not grant permission.') {
+				} else if (error.message === "User did not grant permission.") {
 					return { cancelled: true };
-				} else if (error.message === 'No polkit authentication agent found.') {
+				} else if (error.message === "No polkit authentication agent found.") {
 					throw errors.createUserError({
-						title: 'No polkit authentication agent found',
+						title: "No polkit authentication agent found",
 						description:
-							'Please install a polkit authentication agent for your desktop environment of choice to continue',
+							"Please install a polkit authentication agent for your desktop environment of choice to continue",
 					});
 				}
 				throw error;
